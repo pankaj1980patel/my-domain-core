@@ -1,0 +1,198 @@
+//! Direct messaging transports (UDP / TCP) plus the shared incoming-message
+//! pipeline and the clipboard control-message handling. WebSocket lives in the
+//! `ws` submodule.
+//!
+//! Wire format here is protocol v1 (JSON `Envelope` carrying `Plaintext`); the
+//! binary multiplexed framing (v2) is layered on later in `wire::`.
+
+pub mod ws;
+
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::time::Duration;
+
+use crate::crypto::{decrypt, encrypt};
+use crate::engine::{KeyHolder, NetCtx, WsConns};
+use crate::events::CoreEvent;
+use crate::model::{Envelope, IncomingMessage, Plaintext, WsFrame};
+use crate::platform::Platform;
+use crate::discovery::PeerMap;
+
+fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Decrypt an envelope into a UI message; undecryptable messages are surfaced
+/// (not silently dropped).
+fn envelope_to_message(key: &KeyHolder, env: &Envelope, ip: String, protocol: &str) -> IncomingMessage {
+    if let Some(k) = key.lock().unwrap().as_ref() {
+        if let Some(pt) = decrypt(k, env) {
+            if let Ok(msg) = serde_json::from_slice::<Plaintext>(&pt) {
+                return IncomingMessage {
+                    from: msg.from,
+                    ip,
+                    protocol: protocol.into(),
+                    text: msg.text,
+                    ts: now_secs(),
+                    ok: true,
+                };
+            }
+        }
+    }
+    IncomingMessage {
+        from: "(unknown)".into(),
+        ip,
+        protocol: protocol.into(),
+        text: "🔒 message could not be decrypted (wrong encryption key)".into(),
+        ts: now_secs(),
+        ok: false,
+    }
+}
+
+/// Best transport for a one-off control message: a live WS if present, else UDP.
+fn clip_proto<P: Platform>(ctx: &NetCtx<P>, node_id: &str) -> &'static str {
+    if ctx.ws_conns.lock().unwrap().contains_key(node_id) {
+        "WS"
+    } else {
+        "UDP"
+    }
+}
+
+/// Send an already-built control-message JSON to one peer over the best
+/// available transport (live WS, else UDP). Shared by every discrete feature.
+pub(crate) fn send_control_to<P: Platform>(ctx: &NetCtx<P>, node_id: &str, text: &str) {
+    let from = ctx.identity.lock().unwrap().name.clone();
+    let proto = clip_proto(ctx, node_id);
+    let _ = send_payload(&ctx.peers, &ctx.ws_conns, &ctx.key, &from, node_id, proto, text);
+}
+
+/// Broadcast a control-message JSON to all known peers.
+pub fn broadcast_control<P: Platform>(ctx: &NetCtx<P>, text: &str) {
+    let ids: Vec<String> = ctx.peers.lock().unwrap().keys().cloned().collect();
+    for id in ids {
+        send_control_to(ctx, &id, text);
+    }
+}
+
+/// Decrypt and dispatch an incoming envelope. Clipboard control messages are
+/// handled in-band (never shown as chat); everything else is emitted as a
+/// normal `MessageReceived`.
+pub fn handle_incoming<P: Platform>(ctx: &NetCtx<P>, env: &Envelope, ip: String, protocol: &str) {
+    let pt = {
+        let guard = ctx.key.lock().unwrap();
+        guard.as_ref().and_then(|k| decrypt(k, env))
+    };
+    let Some(pt) = pt else {
+        ctx.sink
+            .emit(CoreEvent::MessageReceived(envelope_to_message(&ctx.key, env, ip, protocol)));
+        return;
+    };
+    let Ok(msg) = serde_json::from_slice::<Plaintext>(&pt) else {
+        return;
+    };
+
+    // Discrete-feature control message? (clipboard / notification / call / …)
+    let control = ctx.control.clone();
+    if control.dispatch(ctx, &msg.from, &ip, protocol, &msg.text) {
+        return;
+    }
+
+    ctx.sink.emit(CoreEvent::MessageReceived(IncomingMessage {
+        from: msg.from,
+        ip,
+        protocol: protocol.into(),
+        text: msg.text,
+        ts: now_secs(),
+        ok: true,
+    }));
+}
+
+/// Encrypt `text` and send it to `node_id` over the given transport. Shared by
+/// the chat send command and the clipboard helpers.
+pub fn send_payload(
+    peers: &PeerMap,
+    ws_conns: &WsConns,
+    key: &KeyHolder,
+    from: &str,
+    node_id: &str,
+    protocol: &str,
+    text: &str,
+) -> Result<(), String> {
+    let k = key.lock().unwrap().ok_or("set your encryption key first")?;
+    let plaintext = serde_json::to_vec(&Plaintext { from: from.to_string(), text: text.to_string() })
+        .map_err(|e| e.to_string())?;
+    let env = encrypt(&k, &plaintext).ok_or("encryption failed")?;
+    let body = serde_json::to_vec(&env).map_err(|e| e.to_string())?;
+
+    let proto = protocol.to_uppercase();
+    if proto == "WS" {
+        let frame = serde_json::to_string(&WsFrame::Msg {
+            nonce: env.nonce.clone(),
+            ciphertext: env.ciphertext.clone(),
+        })
+        .map_err(|e| e.to_string())?;
+        let sender = ws_conns
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .map(|(_, s)| s.clone())
+            .ok_or("no WebSocket connection — trigger 'Connect (WS)' first")?;
+        sender.send(frame).map_err(|_| "WebSocket connection closed".to_string())?;
+        return Ok(());
+    }
+
+    let peer = peers.lock().unwrap().get(node_id).cloned().ok_or("peer not found")?;
+    let ip: Ipv4Addr = peer.ip.parse().map_err(|_| "bad peer ip")?;
+    match proto.as_str() {
+        "TCP" => {
+            let addr = SocketAddr::new(ip.into(), peer.tcp_port);
+            let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+                .map_err(|e| format!("TCP connect failed: {e}"))?;
+            stream.write_all(&body).map_err(|e| format!("TCP send failed: {e}"))?;
+            stream.shutdown(std::net::Shutdown::Write).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        "UDP" => {
+            let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+            socket
+                .send_to(&body, SocketAddr::new(ip.into(), peer.udp_port))
+                .map_err(|e| format!("UDP send failed: {e}"))?;
+            Ok(())
+        }
+        other => Err(format!("unknown protocol: {other}")),
+    }
+}
+
+pub fn tcp_recv_loop<P: Platform>(listener: TcpListener, ctx: NetCtx<P>) {
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let ip = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+            let mut buf = Vec::new();
+            if stream.read_to_end(&mut buf).is_err() {
+                return;
+            }
+            if let Ok(env) = serde_json::from_slice::<Envelope>(&buf) {
+                handle_incoming(&ctx, &env, ip, "TCP");
+            }
+        });
+    }
+}
+
+pub fn udp_recv_loop<P: Platform>(socket: UdpSocket, ctx: NetCtx<P>) {
+    let mut buf = [0u8; 65535];
+    loop {
+        let (len, src) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Ok(env) = serde_json::from_slice::<Envelope>(&buf[..len]) {
+            handle_incoming(&ctx, &env, src.ip().to_string(), "UDP");
+        }
+    }
+}
