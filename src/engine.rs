@@ -28,6 +28,9 @@ pub type KeyHolder = Arc<Mutex<Option<[u8; 32]>>>;
 pub type WsConns = Arc<Mutex<HashMap<String, (u64, mpsc::Sender<String>)>>>;
 /// node_id -> sender awaiting that peer's clipboard pull response.
 pub type ClipPending = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
+/// subscriber node_id -> the package names whose notifications they want
+/// (app-notification pub/sub; held on the producer device).
+pub type Subs = Arc<Mutex<HashMap<String, Vec<String>>>>;
 
 /// Shared handles the receive loops + clipboard watcher need.
 pub struct NetCtx<P: Platform> {
@@ -41,6 +44,10 @@ pub struct NetCtx<P: Platform> {
     pub clip_last: Arc<Mutex<String>>,
     pub clip_pending: ClipPending,
     pub control: Arc<ControlRegistry<P>>,
+    /// Producer's shareable app list as a JSON array string (pushed by the host).
+    pub installed_apps: Arc<Mutex<String>>,
+    /// App-notification subscriptions (subscriber node_id -> packages).
+    pub subs: Subs,
 }
 
 impl<P: Platform> Clone for NetCtx<P> {
@@ -56,6 +63,8 @@ impl<P: Platform> Clone for NetCtx<P> {
             clip_last: self.clip_last.clone(),
             clip_pending: self.clip_pending.clone(),
             control: self.control.clone(),
+            installed_apps: self.installed_apps.clone(),
+            subs: self.subs.clone(),
         }
     }
 }
@@ -88,6 +97,8 @@ pub struct Engine<P: Platform> {
     clip_last: Arc<Mutex<String>>,
     clip_pending: ClipPending,
     control: Arc<ControlRegistry<P>>,
+    installed_apps: Arc<Mutex<String>>,
+    subs: Subs,
 }
 
 impl<P: Platform> Engine<P> {
@@ -126,7 +137,9 @@ impl<P: Platform> Engine<P> {
         let clip_active = Arc::new(AtomicBool::new(false));
         let clip_last = Arc::new(Mutex::new(String::new()));
         let clip_pending: ClipPending = Arc::new(Mutex::new(HashMap::new()));
-        let control = Arc::new(ControlRegistry::with_defaults());
+        let control = Arc::new(ControlRegistry::with_defaults(platform.clipboard().is_some()));
+        let installed_apps = Arc::new(Mutex::new(String::from("[]")));
+        let subs: Subs = Arc::new(Mutex::new(HashMap::new()));
 
         // Discovery socket. If multicast bind fails (some networks/permissions),
         // fall back to a plain UDP socket for sending — messaging still works.
@@ -157,6 +170,8 @@ impl<P: Platform> Engine<P> {
             clip_last: clip_last.clone(),
             clip_pending: clip_pending.clone(),
             control: control.clone(),
+            installed_apps: installed_apps.clone(),
+            subs: subs.clone(),
         };
 
         // Direct messaging receivers.
@@ -232,6 +247,8 @@ impl<P: Platform> Engine<P> {
             clip_last,
             clip_pending,
             control,
+            installed_apps,
+            subs,
         })
     }
 
@@ -247,7 +264,16 @@ impl<P: Platform> Engine<P> {
             clip_last: self.clip_last.clone(),
             clip_pending: self.clip_pending.clone(),
             control: self.control.clone(),
+            installed_apps: self.installed_apps.clone(),
+            subs: self.subs.clone(),
         }
+    }
+
+    /// Send an already-built control-message JSON to one peer (best transport).
+    fn send_control(&self, node_id: &str, json: &str) -> Result<(), String> {
+        let from = self.identity.lock().unwrap().name.clone();
+        let proto = if self.ws_conns.lock().unwrap().contains_key(node_id) { "WS" } else { "UDP" };
+        transport::send_payload(&self.peers, &self.ws_conns, &self.key, &from, node_id, proto, json)
     }
 
     fn emit_peers(&self) {
@@ -550,6 +576,52 @@ impl<P: Platform> Engine<P> {
             serde_json::from_str(entries_json).unwrap_or(serde_json::Value::Null);
         let msg = serde_json::json!({ "type": "call_history", "entries": entries, "from": from }).to_string();
         transport::broadcast_control(&self.net_ctx(), &msg);
+    }
+
+    // --- app-notification pub/sub ---
+
+    /// Set this device's shareable app list (JSON array of {pkg,label}) — pushed
+    /// by the host (e.g. android PackageManager). Producers answer `apps_request`
+    /// with this.
+    pub fn set_installed_apps(&self, apps_json: &str) {
+        *self.installed_apps.lock().unwrap() = apps_json.to_string();
+    }
+
+    /// Consumer: ask a producer for its app list (reply arrives as CoreEvent::AppsList).
+    pub fn request_apps(&self, node_id: &str) -> Result<(), String> {
+        let me = self.identity.lock().unwrap().node_id.clone();
+        let m = serde_json::json!({ "type": "apps_request", "from": me }).to_string();
+        self.send_control(node_id, &m)
+    }
+
+    /// Consumer: set the full enabled package set on a producer.
+    pub fn subscribe_apps(&self, node_id: &str, apps_json: &str) -> Result<(), String> {
+        let me = self.identity.lock().unwrap().node_id.clone();
+        let apps: serde_json::Value =
+            serde_json::from_str(apps_json).unwrap_or(serde_json::Value::Array(vec![]));
+        let m = serde_json::json!({ "type": "subscribe_apps", "from": me, "apps": apps }).to_string();
+        self.send_control(node_id, &m)
+    }
+
+    /// Producer: a local app posted a notification — forward it to every peer
+    /// subscribed to that package (as a normal `notification`).
+    pub fn share_app_notification(&self, pkg: &str, app: &str, title: &str, body: &str) {
+        let me = self.identity.lock().unwrap().node_id.clone();
+        let targets: Vec<String> = self
+            .subs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, pkgs)| pkgs.iter().any(|p| p == pkg))
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in targets {
+            let m = serde_json::json!({
+                "type": "notification", "from": me, "title": title, "body": body, "app": app,
+            })
+            .to_string();
+            let _ = self.send_control(&n, &m);
+        }
     }
 
     // --- signaling / connection setup (Roadmap B) ---

@@ -45,6 +45,13 @@ pub enum CoreEvent {
         from: String,
         entries: serde_json::Value,
     },
+    /// A producer device returned its shareable app list + which of them this
+    /// device is currently subscribed to.
+    AppsList {
+        from: String,
+        apps: serde_json::Value,       // [{ "pkg": ..., "label": ... }]
+        subscribed: serde_json::Value, // [ "pkg", ... ]
+    },
 }
 
 pub trait EventSink: Send + Sync + 'static {

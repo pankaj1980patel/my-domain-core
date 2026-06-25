@@ -12,6 +12,7 @@
 pub mod call_history;
 pub mod call_notification;
 pub mod clipboard;
+pub mod notif_apps;
 pub mod notification;
 
 use std::collections::HashMap;
@@ -62,13 +63,20 @@ pub struct ControlRegistry<P: Platform> {
 }
 
 impl<P: Platform> ControlRegistry<P> {
-    /// The standard feature set wired into every build.
-    pub fn with_defaults() -> Self {
+    /// The standard feature set. `has_clipboard` should reflect whether the
+    /// platform provides a `Clipboard`: when it doesn't (e.g. android handles
+    /// clipboard in its host layer), the clipboard handler is left unregistered
+    /// so those control messages pass through to the host instead of being
+    /// swallowed here.
+    pub fn with_defaults(has_clipboard: bool) -> Self {
         let mut r = ControlRegistry { handlers: HashMap::new() };
-        r.register(Arc::new(clipboard::ClipboardHandler));
+        if has_clipboard {
+            r.register(Arc::new(clipboard::ClipboardHandler));
+        }
         r.register(Arc::new(notification::NotificationHandler));
         r.register(Arc::new(call_notification::CallNotificationHandler));
         r.register(Arc::new(call_history::CallHistoryHandler));
+        r.register(Arc::new(notif_apps::NotifAppsHandler));
         r
     }
 
