@@ -14,6 +14,7 @@ pub mod call_notification;
 pub mod clipboard;
 pub mod notif_apps;
 pub mod notification;
+pub mod p2p_ping;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,6 +78,7 @@ impl<P: Platform> ControlRegistry<P> {
         r.register(Arc::new(call_notification::CallNotificationHandler));
         r.register(Arc::new(call_history::CallHistoryHandler));
         r.register(Arc::new(notif_apps::NotifAppsHandler));
+        r.register(Arc::new(p2p_ping::P2pPingHandler));
         r
     }
 

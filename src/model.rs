@@ -46,6 +46,16 @@ pub struct Peer {
     pub udp_port: u16,
     pub ws_port: u16,
     pub source: Source,
+    /// Peer-reported reachability (from the registry; `false`/`None` for
+    /// LAN/manual peers we discovered ourselves). Drives the connect ladder.
+    #[serde(default)]
+    pub ws_open: bool,
+    #[serde(default)]
+    pub inbound_blocked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflexive_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflexive_udp_port: Option<u16>,
 }
 
 /// Decrypted message body.

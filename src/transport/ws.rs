@@ -15,7 +15,7 @@ use crate::events::CoreEvent;
 use crate::model::{Envelope, WsFrame};
 use crate::platform::Platform;
 
-use super::handle_incoming;
+use super::{handle_incoming, mark_live, drop_live, TransportKind};
 
 static WS_CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -59,6 +59,7 @@ pub fn handle_ws_conn<S: Read + Write, P: Platform>(mut ws: tungstenite::WebSock
                             guard.insert(node_id.clone(), (my_conn_id, tx.clone()));
                             drop(guard);
                             ctx.sink.emit(CoreEvent::WsConnected { node_id: node_id.clone() });
+                            mark_live(&ctx, &node_id, TransportKind::Ws, None);
                             peer_id = Some(node_id);
                         }
                         WsFrame::Msg { nonce, ciphertext } => {
@@ -92,7 +93,8 @@ pub fn handle_ws_conn<S: Read + Write, P: Platform>(mut ws: tungstenite::WebSock
         if g.get(&pid).map(|(id, _)| *id == my_conn_id).unwrap_or(false) {
             g.remove(&pid);
             drop(g);
-            ctx.sink.emit(CoreEvent::WsDisconnected { node_id: pid });
+            ctx.sink.emit(CoreEvent::WsDisconnected { node_id: pid.clone() });
+            drop_live(&ctx, &pid);
         }
     }
 }

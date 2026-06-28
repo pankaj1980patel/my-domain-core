@@ -8,11 +8,14 @@ description = "my-domain shared core: crypto, wire protocol, discovery, transpor
 name = "mdcore"
 
 [features]
-default = []
+default = ["webrtc"]
 # Heavy, optional services. Excluded from low-power builds so their codec/media
 # deps are not pulled in.
 av = []
 remote-control = []
+# WebRTC data-channel rung (str0m, pure-Rust sans-IO with the RustCrypto DTLS
+# backend — no tokio, no C/C++). Gated so minimal builds can drop it.
+webrtc = ["dep:str0m"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -27,3 +30,6 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # an ngrok https tunnel). Matches the android client's stricter feature set.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+# Lightweight, sans-IO WebRTC for the final connect rung. RustCrypto backend
+# only (no aws-lc/openssl) so it cross-compiles cleanly (incl. android NDK).
+str0m = { version = "0.21", default-features = false, features = ["rust-crypto"], optional = true }

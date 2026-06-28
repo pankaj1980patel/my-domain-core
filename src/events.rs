@@ -7,6 +7,7 @@
 //! reaches the UI.
 
 use crate::model::{IncomingMessage, Peer};
+use crate::transport::TransportKind;
 
 #[derive(Clone)]
 pub enum CoreEvent {
@@ -18,6 +19,13 @@ pub enum CoreEvent {
     WsConnected { node_id: String },
     /// A WebSocket connection to a peer closed.
     WsDisconnected { node_id: String },
+    /// A live peer-to-peer connection came up (over any transport). This is the
+    /// single source of truth for the UI "connected" (green) indicator.
+    PeerConnected { node_id: String, transport: TransportKind },
+    /// A live peer-to-peer connection went away (closed or went stale).
+    PeerDisconnected { node_id: String },
+    /// Progress of an in-flight `connect()` ladder, for UI feedback.
+    ConnectProgress { node_id: String, stage: String, detail: Option<String> },
     /// A clipboard value was synced from a peer (active mode).
     Clipboard {
         from: String,

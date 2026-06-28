@@ -23,6 +23,16 @@ pub struct RegistryDevice {
     pub udp_port: u16,
     #[serde(default)]
     pub ws_port: u16,
+    // Peer-visible reachability state (server `DeviceOut`); defaulted so older
+    // server responses still deserialize.
+    #[serde(default)]
+    pub ws_open: bool,
+    #[serde(default)]
+    pub inbound_blocked: bool,
+    #[serde(default)]
+    pub reflexive_ip: Option<String>,
+    #[serde(default)]
+    pub reflexive_udp_port: Option<u16>,
 }
 
 /// Normalize a user-entered server URL to just `scheme://host[:port]`, dropping

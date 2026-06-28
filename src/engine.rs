@@ -21,7 +21,7 @@ use crate::model::{Identity, Peer, Source};
 use crate::platform::Platform;
 use crate::registry::{auth_call, base, registry_fetch, registry_register, verify_password_call, RegistryDevice};
 use crate::signal::Signal;
-use crate::transport::{self, ws};
+use crate::transport::{self, ws, P2pConns};
 
 pub type KeyHolder = Arc<Mutex<Option<[u8; 32]>>>;
 /// node_id -> (connection id, outgoing-frame sender). One entry per peer.
@@ -31,6 +31,11 @@ pub type ClipPending = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
 /// subscriber node_id -> the package names whose notifications they want
 /// (app-notification pub/sub; held on the producer device).
 pub type Subs = Arc<Mutex<HashMap<String, Vec<String>>>>;
+/// In-flight punch negotiations: sid -> sender that delivers the peer's answered
+/// candidates to the waiting initiator thread.
+pub type PunchWaiters = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<crate::signal::Candidate>>>>>;
+/// In-flight WebRTC negotiations: sid -> sender delivering the answer SDP string.
+pub type RtcWaiters = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
 
 /// Shared handles the receive loops + clipboard watcher need.
 pub struct NetCtx<P: Platform> {
@@ -39,6 +44,12 @@ pub struct NetCtx<P: Platform> {
     pub key: KeyHolder,
     pub peers: PeerMap,
     pub ws_conns: WsConns,
+    /// Unified live-connection registry (all transports). UI green dot reads this.
+    pub p2p_conns: P2pConns,
+    /// In-flight punch negotiations (initiator side).
+    pub punch_waiters: PunchWaiters,
+    /// In-flight WebRTC negotiations (initiator side).
+    pub rtc_waiters: RtcWaiters,
     pub sink: Arc<dyn EventSink>,
     pub clip_active: Arc<AtomicBool>,
     pub clip_last: Arc<Mutex<String>>,
@@ -58,6 +69,9 @@ impl<P: Platform> Clone for NetCtx<P> {
             key: self.key.clone(),
             peers: self.peers.clone(),
             ws_conns: self.ws_conns.clone(),
+            p2p_conns: self.p2p_conns.clone(),
+            punch_waiters: self.punch_waiters.clone(),
+            rtc_waiters: self.rtc_waiters.clone(),
             sink: self.sink.clone(),
             clip_active: self.clip_active.clone(),
             clip_last: self.clip_last.clone(),
@@ -88,6 +102,9 @@ pub struct Engine<P: Platform> {
     identity: Arc<Mutex<Identity>>,
     peers: PeerMap,
     ws_conns: WsConns,
+    p2p_conns: P2pConns,
+    punch_waiters: PunchWaiters,
+    rtc_waiters: RtcWaiters,
     key: KeyHolder,
     server_url: Arc<Mutex<Option<String>>>,
     token: Arc<Mutex<Option<String>>>,
@@ -133,6 +150,9 @@ impl<P: Platform> Engine<P> {
 
         let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
         let ws_conns: WsConns = Arc::new(Mutex::new(HashMap::new()));
+        let p2p_conns: P2pConns = Arc::new(Mutex::new(HashMap::new()));
+        let punch_waiters: PunchWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let rtc_waiters: RtcWaiters = Arc::new(Mutex::new(HashMap::new()));
         let key: KeyHolder = Arc::new(Mutex::new(None));
         let clip_active = Arc::new(AtomicBool::new(false));
         let clip_last = Arc::new(Mutex::new(String::new()));
@@ -165,6 +185,9 @@ impl<P: Platform> Engine<P> {
             key: key.clone(),
             peers: peers.clone(),
             ws_conns: ws_conns.clone(),
+            p2p_conns: p2p_conns.clone(),
+            punch_waiters: punch_waiters.clone(),
+            rtc_waiters: rtc_waiters.clone(),
             sink: sink.clone(),
             clip_active: clip_active.clone(),
             clip_last: clip_last.clone(),
@@ -232,12 +255,44 @@ impl<P: Platform> Engine<P> {
             });
         }
 
+        // P2P heartbeat: keepalive pings for connectionless links (UDP/punch/
+        // webrtc) and staleness eviction. WS is event-driven, so it's skipped.
+        {
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                const INTERVAL: Duration = Duration::from_secs(5);
+                const TIMEOUT: u64 = 15;
+                loop {
+                    std::thread::sleep(INTERVAL);
+                    let me = ctx.identity.lock().unwrap().node_id.clone();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let ping = serde_json::json!({ "type": "p2p_ping", "from": me }).to_string();
+                    for (node_id, kind, last_seen) in transport::live_snapshot(&ctx) {
+                        if kind == transport::TransportKind::Ws {
+                            continue;
+                        }
+                        if now.saturating_sub(last_seen) > TIMEOUT {
+                            transport::drop_live(&ctx, &node_id);
+                        } else {
+                            transport::send_control_to(&ctx, &node_id, &ping);
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(Engine {
             platform,
             sink,
             identity,
             peers,
             ws_conns,
+            p2p_conns,
+            punch_waiters,
+            rtc_waiters,
             key,
             server_url: Arc::new(Mutex::new(None)),
             token: Arc::new(Mutex::new(None)),
@@ -259,6 +314,9 @@ impl<P: Platform> Engine<P> {
             key: self.key.clone(),
             peers: self.peers.clone(),
             ws_conns: self.ws_conns.clone(),
+            p2p_conns: self.p2p_conns.clone(),
+            punch_waiters: self.punch_waiters.clone(),
+            rtc_waiters: self.rtc_waiters.clone(),
             sink: self.sink.clone(),
             clip_active: self.clip_active.clone(),
             clip_last: self.clip_last.clone(),
@@ -292,7 +350,7 @@ impl<P: Platform> Engine<P> {
     }
 
     pub fn connected_peers(&self) -> Vec<String> {
-        self.ws_conns.lock().unwrap().keys().cloned().collect()
+        self.p2p_conns.lock().unwrap().keys().cloned().collect()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -418,6 +476,10 @@ impl<P: Platform> Engine<P> {
                         udp_port: d.udp_port,
                         ws_port: d.ws_port,
                         source: Source::Registry,
+                        ws_open: d.ws_open,
+                        inbound_blocked: d.inbound_blocked,
+                        reflexive_ip: d.reflexive_ip,
+                        reflexive_udp_port: d.reflexive_udp_port,
                     },
                 );
             }
@@ -468,6 +530,10 @@ impl<P: Platform> Engine<P> {
                 udp_port,
                 ws_port,
                 source: Source::Manual,
+                ws_open: false,
+                inbound_blocked: false,
+                reflexive_ip: None,
+                reflexive_udp_port: None,
             },
         );
         self.emit_peers();
@@ -639,7 +705,39 @@ impl<P: Platform> Engine<P> {
         let node_id = self.identity.lock().unwrap().node_id.clone();
         let probe = crate::registry::probe_inbound(&url, &token, &node_id, &["tcp", "ws"])?;
         let inbound_blocked = !(probe.tcp_reachable || probe.ws_reachable);
+        // Persist so siblings see our reachability via `GET /devices` and the
+        // connect ladder can use it. Best-effort — don't fail the check on this.
+        let _ = crate::registry::update_device_state(
+            &url,
+            &token,
+            &node_id,
+            None,
+            Some(inbound_blocked),
+            None,
+            None,
+        );
         Ok(FirewallStatus { outbound_ok, inbound_blocked })
+    }
+
+    /// Run the firewall check on a background thread and persist the result, so
+    /// other devices see our reachability. Called once after login (the probe
+    /// does a blocking server dial-back, so it must not run on the UI thread).
+    pub fn report_firewall(&self) {
+        let url = self.server_url.lock().unwrap().clone();
+        let token = self.token.lock().unwrap().clone();
+        let node_id = self.identity.lock().unwrap().node_id.clone();
+        let (Some(url), Some(token)) = (url, token) else { return };
+        std::thread::spawn(move || {
+            if !crate::registry::health_ok(&url) {
+                return;
+            }
+            if let Ok(probe) = crate::registry::probe_inbound(&url, &token, &node_id, &["tcp", "ws"]) {
+                let inbound_blocked = !(probe.tcp_reachable || probe.ws_reachable);
+                let _ = crate::registry::update_device_state(
+                    &url, &token, &node_id, None, Some(inbound_blocked), None, None,
+                );
+            }
+        });
     }
 
     /// Tell the registry whether our WS server is currently reachable.
@@ -690,26 +788,78 @@ impl<P: Platform> Engine<P> {
             Signal::WsReady { ip, ws_port, .. } => {
                 let _ = ws::ws_connect(self.net_ctx(), &ip, ws_port);
             }
-            // Hole punch / TURN: handled by the NAT module (wired during the
-            // streaming/NAT phase — see crate::nat).
+            // Initiator wants to hole-punch: gather our candidates, answer with
+            // them, and punch toward theirs. Off-thread (STUN + HTTP block).
+            Signal::PunchOffer { sid, candidates, .. } => {
+                let ctx = self.net_ctx();
+                let from = from.to_string();
+                let server_url = self.server_url.clone();
+                let token = self.token.clone();
+                std::thread::spawn(move || {
+                    if let Some((socket, my_cands)) = transport::punch::gather_candidates(&ctx) {
+                        let _ = send_signal_via(
+                            &server_url,
+                            &token,
+                            &ctx,
+                            &from,
+                            &Signal::PunchAnswer { sid, candidates: my_cands, start_in_ms: 0 },
+                        );
+                        transport::punch::punch_and_run(ctx, socket, candidates, from);
+                    }
+                });
+            }
+            // Our offer was answered: hand the peer's candidates to the waiting
+            // ladder thread so it can punch.
+            Signal::PunchAnswer { sid, candidates, .. } => {
+                let waiter = self.punch_waiters.lock().unwrap().remove(&sid);
+                if let Some(tx) = waiter {
+                    let _ = tx.send(candidates);
+                }
+            }
+            // WebRTC: responder accepts the offer, spawns the driver, answers.
+            #[cfg(feature = "webrtc")]
+            Signal::SdpOffer { sid, sdp } => {
+                let ctx = self.net_ctx();
+                let from = from.to_string();
+                let server_url = self.server_url.clone();
+                let token = self.token.clone();
+                std::thread::spawn(move || {
+                    if let Some(answer) = transport::rtc::accept_offer_and_run(ctx.clone(), &sdp, from.clone()) {
+                        let _ = send_signal_via(&server_url, &token, &ctx, &from, &Signal::SdpAnswer { sid, sdp: answer });
+                    }
+                });
+            }
+            // WebRTC: hand the answer SDP to the waiting initiator thread.
+            #[cfg(feature = "webrtc")]
+            Signal::SdpAnswer { sid, sdp } => {
+                let waiter = self.rtc_waiters.lock().unwrap().remove(&sid);
+                if let Some(tx) = waiter {
+                    let _ = tx.send(sdp);
+                }
+            }
+            // Teardown.
+            Signal::Bye { .. } => {
+                transport::drop_live(&self.net_ctx(), from);
+            }
+            // RelayOffer/RelayAnswer (TURN) remain a future hook.
             _ => {}
         }
     }
 
-    /// Best-effort connect to a peer along the fallback ladder. Direct WS first;
-    /// if that's not reachable, ask the peer (via signaling) to open its WS and
-    /// dial back — the reply arrives through `on_signal`.
+    /// Kick off the connection ladder on a background thread (returns at once).
+    /// Progress is reported via `CoreEvent::ConnectProgress`; success lands as a
+    /// `PeerConnected` event when any rung establishes a live link.
     pub fn connect(&self, node_id: &str) -> Result<(), String> {
-        let peer = self.peers.lock().unwrap().get(node_id).cloned().ok_or("peer not found")?;
-        // 1. Direct WS if the peer advertises one and is reachable.
-        if peer.ws_port != 0 && !peer_inbound_blocked(&peer) {
-            if self.connect_ws(node_id).is_ok() {
-                return Ok(());
-            }
+        // Validate the peer exists up front so the button gets immediate feedback.
+        if !self.peers.lock().unwrap().contains_key(node_id) {
+            return Err("peer not found".into());
         }
-        // 2. FCM-coordinated start-WS. Peer replies WsReady → on_signal dials.
-        let sid = uuid::Uuid::new_v4().to_string();
-        self.send_signal(node_id, &Signal::StartWs { sid })
+        let ctx = self.net_ctx();
+        let server_url = self.server_url.clone();
+        let token = self.token.clone();
+        let node_id = node_id.to_string();
+        std::thread::spawn(move || run_connect_ladder(ctx, server_url, token, node_id));
+        Ok(())
     }
 }
 
@@ -719,10 +869,177 @@ pub struct FirewallStatus {
     pub inbound_blocked: bool,
 }
 
-/// Peers from LAN/registry don't currently carry the firewall flag in the core
-/// `Peer` struct; treat unknown as not-blocked so the direct attempt is made.
-fn peer_inbound_blocked(_peer: &Peer) -> bool {
-    false
+/// Whether a peer reported it can't receive inbound connections. LAN/manual
+/// peers default to `false` (unknown → attempt direct); registry peers carry the
+/// real flag the device self-reported via `report_firewall`.
+fn peer_inbound_blocked(peer: &Peer) -> bool {
+    peer.inbound_blocked
+}
+
+// ---------------------------------------------------------------------------
+// Connection ladder (runs off-thread; uses only NetCtx + the server creds, so
+// it doesn't need `&Engine`). Each rung emits ConnectProgress and bails to the
+// next on timeout. Rungs are ordered cheapest-first.
+// ---------------------------------------------------------------------------
+
+/// Same-LAN heuristic: LAN-discovered peer, or our IPs share a /24.
+fn same_lan<P: Platform>(ctx: &NetCtx<P>, peer: &Peer) -> bool {
+    if peer.source == Source::Lan {
+        return true;
+    }
+    let my_ip = ctx.identity.lock().unwrap().ip.clone();
+    match (my_ip.parse::<Ipv4Addr>(), peer.ip.parse::<Ipv4Addr>()) {
+        (Ok(a), Ok(b)) => a.octets()[..3] == b.octets()[..3],
+        _ => false,
+    }
+}
+
+fn is_live<P: Platform>(ctx: &NetCtx<P>, node_id: &str) -> bool {
+    ctx.p2p_conns.lock().unwrap().contains_key(node_id)
+}
+
+/// Poll for the peer to become live, up to `ms` milliseconds.
+fn wait_live<P: Platform>(ctx: &NetCtx<P>, node_id: &str, ms: u64) -> bool {
+    let steps = ms / 100;
+    for _ in 0..steps {
+        std::thread::sleep(Duration::from_millis(100));
+        if is_live(ctx, node_id) {
+            return true;
+        }
+    }
+    is_live(ctx, node_id)
+}
+
+/// Send one UDP ping and wait briefly for the pong to flip the peer live.
+fn udp_ping_connect<P: Platform>(ctx: &NetCtx<P>, node_id: &str) -> bool {
+    let (me, name) = {
+        let id = ctx.identity.lock().unwrap();
+        (id.node_id.clone(), id.name.clone())
+    };
+    let ping = serde_json::json!({ "type": "p2p_ping", "from": me }).to_string();
+    if transport::send_payload(&ctx.peers, &ctx.ws_conns, &ctx.key, &name, node_id, "UDP", &ping).is_err() {
+        return false;
+    }
+    wait_live(ctx, node_id, 2000)
+}
+
+/// Relay a typed signal using the shared server creds (thread-friendly twin of
+/// `Engine::send_signal`).
+fn send_signal_via<P: Platform>(
+    server_url: &Arc<Mutex<Option<String>>>,
+    token: &Arc<Mutex<Option<String>>>,
+    ctx: &NetCtx<P>,
+    to: &str,
+    sig: &Signal,
+) -> Result<(), String> {
+    let url = server_url.lock().unwrap().clone().ok_or("not logged in")?;
+    let tok = token.lock().unwrap().clone().ok_or("not logged in")?;
+    let me = ctx.identity.lock().unwrap().node_id.clone();
+    let data = serde_json::to_value(sig).map_err(|e| e.to_string())?;
+    crate::registry::send_signal(&url, &tok, &me, to, "signal", data)
+}
+
+fn run_connect_ladder<P: Platform>(
+    ctx: NetCtx<P>,
+    server_url: Arc<Mutex<Option<String>>>,
+    token: Arc<Mutex<Option<String>>>,
+    node_id: String,
+) {
+    let emit = |stage: &str, detail: Option<String>| {
+        ctx.sink.emit(CoreEvent::ConnectProgress {
+            node_id: node_id.clone(),
+            stage: stage.into(),
+            detail,
+        });
+    };
+
+    if is_live(&ctx, &node_id) {
+        emit("connected", None);
+        return;
+    }
+    let Some(peer) = ctx.peers.lock().unwrap().get(&node_id).cloned() else {
+        emit("failed", Some("peer not found".into()));
+        return;
+    };
+
+    // Rung 1 — same-LAN UDP ping/pong (no FCM, no server).
+    if same_lan(&ctx, &peer) {
+        emit("udp_ping", None);
+        if udp_ping_connect(&ctx, &node_id) {
+            emit("connected", Some("udp".into()));
+            return;
+        }
+    }
+
+    // Rung 2 — direct WS if the peer advertises a reachable WS server.
+    if peer.ws_port != 0 && peer.ws_open && !peer_inbound_blocked(&peer) {
+        emit("direct_ws", None);
+        if ws::ws_connect(ctx.clone(), &peer.ip, peer.ws_port).is_ok() && wait_live(&ctx, &node_id, 3000) {
+            return; // WS handler emits PeerConnected
+        }
+    }
+
+    // Rung 3 — FCM-coordinated WS: ask the peer to open its WS and reply WsReady,
+    // which our on_signal dials. (1 FCM round trip.)
+    emit("via_signal", None);
+    let sid = uuid::Uuid::new_v4().to_string();
+    if send_signal_via(&server_url, &token, &ctx, &node_id, &Signal::StartWs { sid }).is_ok()
+        && wait_live(&ctx, &node_id, 8000)
+    {
+        return;
+    }
+
+    // Rung 4 — UDP hole punch. Gather our candidates up front, offer them in one
+    // signal, and punch toward the peer's answered candidates (1 FCM round trip).
+    emit("punching", None);
+    if let Some((socket, my_cands)) = transport::punch::gather_candidates(&ctx) {
+        let sid = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = mpsc::channel::<Vec<crate::signal::Candidate>>();
+        ctx.punch_waiters.lock().unwrap().insert(sid.clone(), tx);
+        let offer = Signal::PunchOffer { sid: sid.clone(), candidates: my_cands, start_in_ms: 0 };
+        if send_signal_via(&server_url, &token, &ctx, &node_id, &offer).is_ok() {
+            if let Ok(peer_cands) = rx.recv_timeout(Duration::from_secs(8)) {
+                ctx.punch_waiters.lock().unwrap().remove(&sid);
+                transport::punch::punch_and_run(ctx.clone(), socket, peer_cands, node_id.clone());
+                if wait_live(&ctx, &node_id, 9000) {
+                    return;
+                }
+            } else {
+                ctx.punch_waiters.lock().unwrap().remove(&sid);
+            }
+        } else {
+            ctx.punch_waiters.lock().unwrap().remove(&sid);
+        }
+    }
+
+    // Rung 5 — WebRTC data channel. Gather candidates into one SDP offer, send
+    // it, and on the single answer drive ICE/DTLS/SCTP peer-to-peer (1 FCM RTT).
+    #[cfg(feature = "webrtc")]
+    {
+        emit("webrtc", None);
+        if let Some((rtc, socket, pending, offer_sdp)) = transport::rtc::create_offer(&ctx) {
+            let sid = uuid::Uuid::new_v4().to_string();
+            let (tx, rx) = mpsc::channel::<String>();
+            ctx.rtc_waiters.lock().unwrap().insert(sid.clone(), tx);
+            let offer = Signal::SdpOffer { sid: sid.clone(), sdp: offer_sdp };
+            if send_signal_via(&server_url, &token, &ctx, &node_id, &offer).is_ok() {
+                if let Ok(answer_sdp) = rx.recv_timeout(Duration::from_secs(10)) {
+                    ctx.rtc_waiters.lock().unwrap().remove(&sid);
+                    if transport::rtc::apply_answer_and_run(ctx.clone(), rtc, socket, pending, &answer_sdp, node_id.clone())
+                        && wait_live(&ctx, &node_id, 12000)
+                    {
+                        return;
+                    }
+                } else {
+                    ctx.rtc_waiters.lock().unwrap().remove(&sid);
+                }
+            } else {
+                ctx.rtc_waiters.lock().unwrap().remove(&sid);
+            }
+        }
+    }
+
+    emit("failed", Some("no reachable path".into()));
 }
 
 // Keep DISCOVERY_PORT reachable for adapters that want it.

@@ -39,6 +39,12 @@ pub enum Signal {
     RelayOffer { sid: String, turn_uri: String, username: String, credential: String },
     RelayAnswer { sid: String },
 
+    /// WebRTC data-channel offer/answer. The `sdp` is a serialized str0m
+    /// SdpOffer/SdpAnswer that already embeds the host + reflexive candidates
+    /// (no trickle ICE), so the exchange is one message each way.
+    SdpOffer { sid: String, sdp: String },
+    SdpAnswer { sid: String, sdp: String },
+
     /// Abort / teardown.
     Bye { sid: String },
 }

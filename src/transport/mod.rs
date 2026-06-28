@@ -5,11 +5,18 @@
 //! Wire format here is protocol v1 (JSON `Envelope` carrying `Plaintext`); the
 //! binary multiplexed framing (v2) is layered on later in `wire::`.
 
+pub mod punch;
+#[cfg(feature = "webrtc")]
+pub mod rtc;
 pub mod ws;
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use serde::Serialize;
 
 use crate::crypto::{decrypt, encrypt};
 use crate::engine::{KeyHolder, NetCtx, WsConns};
@@ -24,6 +31,95 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Unified live-connection model — the single source of truth for "who is
+// connected, over what transport". The UI green dot reads ONLY this.
+// ---------------------------------------------------------------------------
+
+/// Which transport a live P2P link is using. Serializes lowercase for the UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportKind {
+    Ws,
+    Udp,
+    Punch,
+    WebRtc,
+}
+
+/// A live peer-to-peer link. `last_seen` drives heartbeat staleness for the
+/// connectionless transports (UDP/Punch/WebRtc); WS is event-driven.
+#[derive(Clone)]
+pub struct P2pConn {
+    pub kind: TransportKind,
+    pub last_seen: u64,
+    pub addr: Option<SocketAddr>,
+}
+
+/// node_id -> live link.
+pub type P2pConns = Arc<Mutex<HashMap<String, P2pConn>>>;
+
+/// Mark a peer live (first time) or refresh an existing link. The transport is
+/// fixed at establishment by whoever created the link (ws/punch/webrtc); a
+/// refresh (e.g. a heartbeat ping) only bumps `last_seen` and never downgrades
+/// the kind. Emits `PeerConnected` only on first appearance. Never emits under
+/// the lock.
+pub fn mark_live<P: Platform>(ctx: &NetCtx<P>, node_id: &str, kind: TransportKind, addr: Option<SocketAddr>) {
+    let newly = {
+        let mut m = ctx.p2p_conns.lock().unwrap();
+        match m.get_mut(node_id) {
+            Some(c) => {
+                c.last_seen = now_secs();
+                if addr.is_some() {
+                    c.addr = addr;
+                }
+                false
+            }
+            None => {
+                m.insert(node_id.to_string(), P2pConn { kind, last_seen: now_secs(), addr });
+                true
+            }
+        }
+    };
+    if newly {
+        ctx.sink.emit(CoreEvent::PeerConnected { node_id: node_id.to_string(), transport: kind });
+    }
+}
+
+/// Refresh `last_seen` for an existing live peer (e.g. on pong/keepalive).
+pub fn touch_live<P: Platform>(ctx: &NetCtx<P>, node_id: &str) {
+    if let Some(c) = ctx.p2p_conns.lock().unwrap().get_mut(node_id) {
+        c.last_seen = now_secs();
+    }
+}
+
+/// Drop a peer's live link. Emits `PeerDisconnected` if it was present.
+pub fn drop_live<P: Platform>(ctx: &NetCtx<P>, node_id: &str) {
+    let removed = ctx.p2p_conns.lock().unwrap().remove(node_id).is_some();
+    if removed {
+        ctx.sink.emit(CoreEvent::PeerDisconnected { node_id: node_id.to_string() });
+    }
+}
+
+/// Snapshot of live peers and their transports.
+pub fn live_peers<P: Platform>(ctx: &NetCtx<P>) -> Vec<(String, TransportKind, Option<SocketAddr>)> {
+    ctx.p2p_conns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.kind, v.addr))
+        .collect()
+}
+
+/// Snapshot of live peers with their `last_seen` — for heartbeat staleness checks.
+pub fn live_snapshot<P: Platform>(ctx: &NetCtx<P>) -> Vec<(String, TransportKind, u64)> {
+    ctx.p2p_conns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.kind, v.last_seen))
+        .collect()
 }
 
 /// Decrypt an envelope into a UI message; undecryptable messages are surfaced

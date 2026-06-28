@@ -121,6 +121,10 @@ pub fn discovery_recv_loop(
                 udp_port: beacon.udp_port,
                 ws_port: beacon.ws_port,
                 source: Source::Lan,
+                ws_open: false,
+                inbound_blocked: false,
+                reflexive_ip: None,
+                reflexive_udp_port: None,
             },
         );
         let list: Vec<Peer> = peers.lock().unwrap().values().cloned().collect();
