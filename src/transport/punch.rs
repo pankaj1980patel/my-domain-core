@@ -9,7 +9,7 @@
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::engine::NetCtx;
 use crate::model::{Envelope, WsFrame};
@@ -17,9 +17,15 @@ use crate::nat::{punch::hole_punch, stun::stun_binding};
 use crate::platform::Platform;
 use crate::signal::Candidate;
 
-use super::{drop_live, handle_incoming, mark_live, TransportKind};
+use super::{drop_live, handle_incoming, mark_live, touch_live, TransportKind};
 
 const PUNCH_MAGIC: &[u8] = b"mdpunch1";
+/// Driver-level keepalive/handshake probes (distinct from the WsFrame data that
+/// also rides this socket). PING is the same bytes as the punch magic so a peer
+/// still finishing `hole_punch` recognizes it; PONG is the reply that proves the
+/// *round trip*. We only declare the link live once a PONG comes back.
+const PUNCH_PING: &[u8] = PUNCH_MAGIC;
+const PUNCH_PONG: &[u8] = b"mdpong01";
 /// Public STUN server for reflexive-candidate discovery.
 const STUN_SERVER: &str = "stun.l.google.com:19302";
 /// Punch-connection ids live in a high range so they never collide with WS ids.
@@ -74,10 +80,50 @@ pub fn punch_and_run<P: Platform>(ctx: NetCtx<P>, socket: UdpSocket, peer_cands:
     });
 }
 
-/// Driver loop for an established punched link. Registers an outgoing sender in
-/// `ws_conns` and ferries `WsFrame::Msg` frames over the bound UDP path. Exits
-/// (and cleans up) when the heartbeat evicts the peer or a newer link replaces it.
+/// Confirm the path is usable in BOTH directions before we trust it. Receiving
+/// the peer's `hole_punch` probe only proves peer→us; we must also learn that
+/// our packets reach the peer. So ping and wait for a pong: a returned pong means
+/// our ping arrived (us→peer) and its reply came back (peer→us). Returns the
+/// proven peer address, or `None` if the round trip never completes (asymmetric
+/// NAT) — the caller then lets the ladder fall through to WebRTC.
+fn confirm_round_trip(socket: &UdpSocket, mut peer_addr: SocketAddr) -> Option<SocketAddr> {
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(150)));
+    let mut buf = [0u8; 1500];
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last_ping = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    while Instant::now() < deadline {
+        if last_ping.elapsed() >= Duration::from_millis(150) {
+            let _ = socket.send_to(PUNCH_PING, peer_addr);
+            last_ping = Instant::now();
+        }
+        if let Ok((n, src)) = socket.recv_from(&mut buf) {
+            let p = &buf[..n];
+            if p == PUNCH_PONG {
+                return Some(src); // round trip proven
+            }
+            if p == PUNCH_PING {
+                // Peer's probe — reply so its side can confirm too, and lock onto
+                // the address its packets actually come from.
+                peer_addr = src;
+                let _ = socket.send_to(PUNCH_PONG, src);
+            }
+        }
+    }
+    None
+}
+
+/// Driver loop for an established punched link. First confirms a bidirectional
+/// round trip (so we never declare a one-way path "connected"), then registers an
+/// outgoing sender in `ws_conns` and ferries `WsFrame::Msg` frames over the bound
+/// UDP path, replying to keepalive probes and tracking the peer's live address.
+/// Exits (and cleans up) when the heartbeat evicts the peer or a newer link wins.
 fn run_punch_conn<P: Platform>(ctx: NetCtx<P>, socket: UdpSocket, peer_addr: SocketAddr, node_id: String) {
+    let Some(mut peer_addr) = confirm_round_trip(&socket, peer_addr) else {
+        return; // one-way path only — let the ladder advance to WebRTC
+    };
+
     let (tx, rx) = mpsc::channel::<String>();
     let my_conn_id = PUNCH_CONN_SEQ.fetch_add(1, Ordering::Relaxed);
     {
@@ -90,8 +136,9 @@ fn run_punch_conn<P: Platform>(ctx: NetCtx<P>, socket: UdpSocket, peer_addr: Soc
     mark_live(&ctx, &node_id, TransportKind::Punch, Some(peer_addr));
     let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
     let mut buf = [0u8; 65535];
+    let mut last_ka = Instant::now();
     loop {
-        // Flush queued outgoing frames.
+        // Flush queued outgoing frames to the proven peer address.
         let mut dead = false;
         while let Ok(frame) = rx.try_recv() {
             if socket.send_to(frame.as_bytes(), peer_addr).is_err() {
@@ -102,8 +149,23 @@ fn run_punch_conn<P: Platform>(ctx: NetCtx<P>, socket: UdpSocket, peer_addr: Soc
         if dead {
             break;
         }
+        // Socket-level keepalive keeps the NAT binding open between data.
+        if last_ka.elapsed() >= Duration::from_secs(3) {
+            let _ = socket.send_to(PUNCH_PING, peer_addr);
+            last_ka = Instant::now();
+        }
         if let Ok((n, src)) = socket.recv_from(&mut buf) {
-            if let Ok(WsFrame::Msg { nonce, ciphertext }) = serde_json::from_slice::<WsFrame>(&buf[..n]) {
+            let p = &buf[..n];
+            if p == PUNCH_PING {
+                peer_addr = src;
+                touch_live(&ctx, &node_id);
+                let _ = socket.send_to(PUNCH_PONG, src);
+            } else if p == PUNCH_PONG {
+                peer_addr = src;
+                touch_live(&ctx, &node_id);
+            } else if let Ok(WsFrame::Msg { nonce, ciphertext }) = serde_json::from_slice::<WsFrame>(p) {
+                peer_addr = src; // track the peer's current mapping
+                touch_live(&ctx, &node_id);
                 let env = Envelope { nonce, ciphertext };
                 handle_incoming(&ctx, &env, src.ip().to_string(), "UDP");
             }

@@ -1052,7 +1052,8 @@ fn run_connect_ladder<P: Platform>(
             if let Ok(peer_cands) = rx.recv_timeout(Duration::from_secs(8)) {
                 ctx.punch_waiters.lock().unwrap().remove(&sid);
                 transport::punch::punch_and_run(ctx.clone(), socket, peer_cands, node_id.clone());
-                if wait_live(&ctx, &node_id, 9000) {
+                // hole_punch (≤8s) + bidirectional confirmation (≤3s).
+                if wait_live(&ctx, &node_id, 12000) {
                     return;
                 }
             } else {
