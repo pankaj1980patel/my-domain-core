@@ -6,6 +6,7 @@
 //! the engine (send_payload's "WS" branch, send_control_to, the green dot)
 //! treats a punched link exactly like a WebSocket — no special-casing.
 
+use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -26,6 +27,88 @@ const PUNCH_MAGIC: &[u8] = b"mdpunch1";
 /// *round trip*. We only declare the link live once a PONG comes back.
 const PUNCH_PING: &[u8] = PUNCH_MAGIC;
 const PUNCH_PONG: &[u8] = b"mdpong01";
+
+// --- application-level chunking ---------------------------------------------
+// A raw UDP datagram can't reliably carry a large message: >~65 KB fails to send
+// outright, and anything past the path MTU is IP-fragmented and routinely
+// dropped by NAT/routers. So we split each WsFrame into MTU-safe chunks with a
+// tiny header and reassemble on the far side. Header: magic(4) id(4) total(2)
+// index(2) = 12 bytes; payload ≤ CHUNK_PAYLOAD.
+const CHUNK_MAGIC: &[u8] = b"mdck";
+const CHUNK_HDR: usize = 4 + 4 + 2 + 2;
+const CHUNK_PAYLOAD: usize = 1024;
+/// Cap on simultaneously-reassembling messages, so a peer dribbling partial
+/// chunks can't grow memory unbounded.
+const REASM_MAX: usize = 256;
+
+/// Split `data` into chunk datagrams and send each to `peer`. Always emits at
+/// least one datagram (so empty payloads still arrive).
+fn send_chunked(socket: &UdpSocket, peer: SocketAddr, msg_id: u32, data: &[u8]) -> std::io::Result<()> {
+    let chunks: Vec<&[u8]> = if data.is_empty() {
+        vec![&[][..]]
+    } else {
+        data.chunks(CHUNK_PAYLOAD).collect()
+    };
+    let total = chunks.len() as u16;
+    let mut pkt = Vec::with_capacity(CHUNK_HDR + CHUNK_PAYLOAD);
+    for (i, chunk) in chunks.iter().enumerate() {
+        pkt.clear();
+        pkt.extend_from_slice(CHUNK_MAGIC);
+        pkt.extend_from_slice(&msg_id.to_be_bytes());
+        pkt.extend_from_slice(&total.to_be_bytes());
+        pkt.extend_from_slice(&(i as u16).to_be_bytes());
+        pkt.extend_from_slice(chunk);
+        socket.send_to(&pkt, peer)?;
+    }
+    Ok(())
+}
+
+/// In-progress reassembly of one chunked message.
+struct Reasm {
+    total: u16,
+    received: u16,
+    parts: Vec<Option<Vec<u8>>>,
+}
+
+/// Feed one received datagram into the reassembler. Returns `Some(bytes)` when a
+/// message is complete, `None` while still collecting (or if it isn't a chunk).
+fn reasm_feed(pending: &mut HashMap<u32, Reasm>, pkt: &[u8]) -> Option<Vec<u8>> {
+    if pkt.len() < CHUNK_HDR || &pkt[..4] != CHUNK_MAGIC {
+        return None;
+    }
+    let id = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+    let total = u16::from_be_bytes([pkt[8], pkt[9]]);
+    let index = u16::from_be_bytes([pkt[10], pkt[11]]);
+    if total == 0 || index >= total {
+        return None;
+    }
+    let payload = pkt[CHUNK_HDR..].to_vec();
+
+    if pending.len() >= REASM_MAX && !pending.contains_key(&id) {
+        pending.clear(); // shed stalled partials rather than grow forever
+    }
+    let entry = pending.entry(id).or_insert_with(|| Reasm {
+        total,
+        received: 0,
+        parts: vec![None; total as usize],
+    });
+    if entry.total != total {
+        return None; // inconsistent — ignore
+    }
+    if entry.parts[index as usize].is_none() {
+        entry.received += 1;
+        entry.parts[index as usize] = Some(payload);
+    }
+    if entry.received == entry.total {
+        let done = pending.remove(&id)?;
+        let mut out = Vec::new();
+        for p in done.parts {
+            out.extend_from_slice(&p?);
+        }
+        return Some(out);
+    }
+    None
+}
 /// Public STUN server for reflexive-candidate discovery.
 const STUN_SERVER: &str = "stun.l.google.com:19302";
 /// Punch-connection ids live in a high range so they never collide with WS ids.
@@ -137,11 +220,16 @@ fn run_punch_conn<P: Platform>(ctx: NetCtx<P>, socket: UdpSocket, peer_addr: Soc
     let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
     let mut buf = [0u8; 65535];
     let mut last_ka = Instant::now();
+    let mut next_msg_id: u32 = 0;
+    let mut pending: HashMap<u32, Reasm> = HashMap::new();
     loop {
-        // Flush queued outgoing frames to the proven peer address.
+        // Flush queued outgoing frames to the proven peer address, fragmenting
+        // each into MTU-safe chunks so large payloads (e.g. clipboard) survive.
         let mut dead = false;
         while let Ok(frame) = rx.try_recv() {
-            if socket.send_to(frame.as_bytes(), peer_addr).is_err() {
+            let id = next_msg_id;
+            next_msg_id = next_msg_id.wrapping_add(1);
+            if send_chunked(&socket, peer_addr, id, frame.as_bytes()).is_err() {
                 dead = true;
                 break;
             }
@@ -163,11 +251,15 @@ fn run_punch_conn<P: Platform>(ctx: NetCtx<P>, socket: UdpSocket, peer_addr: Soc
             } else if p == PUNCH_PONG {
                 peer_addr = src;
                 touch_live(&ctx, &node_id);
-            } else if let Ok(WsFrame::Msg { nonce, ciphertext }) = serde_json::from_slice::<WsFrame>(p) {
-                peer_addr = src; // track the peer's current mapping
+            } else if let Some(frame) = reasm_feed(&mut pending, p) {
+                // A full message reassembled — track the peer's current mapping
+                // and dispatch it as the WsFrame it is.
+                peer_addr = src;
                 touch_live(&ctx, &node_id);
-                let env = Envelope { nonce, ciphertext };
-                handle_incoming(&ctx, &env, src.ip().to_string(), "UDP");
+                if let Ok(WsFrame::Msg { nonce, ciphertext }) = serde_json::from_slice::<WsFrame>(&frame) {
+                    let env = Envelope { nonce, ciphertext };
+                    handle_incoming(&ctx, &env, src.ip().to_string(), "UDP");
+                }
             }
         }
         // Stop if a newer link replaced our ws_conns slot, or the heartbeat
