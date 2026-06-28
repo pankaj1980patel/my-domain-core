@@ -343,6 +343,24 @@ impl<P: Platform> Engine<P> {
         transport::best_proto(&self.ws_conns, &directed, node_id)
     }
 
+    /// The transport label to *report* for a send. Punch and WebRTC links reuse
+    /// the WS send path (registered in `ws_conns`), so `proto_for` returns "WS"
+    /// for them; resolve the real kind from the live-connection registry so the
+    /// UI shows "punch"/"webrtc" rather than the internal send-path name.
+    fn display_transport(&self, node_id: &str, proto: &'static str) -> String {
+        use transport::TransportKind::*;
+        if let Some(c) = self.p2p_conns.lock().unwrap().get(node_id) {
+            return match c.kind {
+                Ws => "WS",
+                Udp => "UDP",
+                Punch => "punch",
+                WebRtc => "webrtc",
+            }
+            .to_string();
+        }
+        proto.to_string()
+    }
+
     /// Send an already-built control-message JSON to one peer (active connection).
     fn send_control(&self, node_id: &str, json: &str) -> Result<(), String> {
         let from = self.identity.lock().unwrap().name.clone();
@@ -598,7 +616,7 @@ impl<P: Platform> Engine<P> {
             .unwrap_or_else(|| self.identity.lock().unwrap().name.clone());
         let proto = self.proto_for(node_id);
         transport::send_payload(&self.peers, &self.ws_conns, &self.key, &from, node_id, proto, text)?;
-        Ok(proto.to_string())
+        Ok(self.display_transport(node_id, proto))
     }
 
     // --- clipboard ---
