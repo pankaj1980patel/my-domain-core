@@ -149,17 +149,31 @@ fn envelope_to_message(key: &KeyHolder, env: &Envelope, ip: String, protocol: &s
     }
 }
 
-/// Best transport for a one-off control message: a live WS if present, else UDP.
-fn clip_proto<P: Platform>(ctx: &NetCtx<P>, node_id: &str) -> &'static str {
-    if ctx.ws_conns.lock().unwrap().contains_key(node_id) {
+/// Pick the transport for a message to `node_id`. Any live persistent channel —
+/// WebSocket, UDP hole-punch, or WebRTC, all of which register in `ws_conns` and
+/// share its `"WS"` framed send path — is always preferred so exchanges ride the
+/// active connection. With no such channel, fall back to the user's directed
+/// transport preference (`UDP` default, or `TCP`). This is the single chooser
+/// used by chat send and every discrete feature.
+pub fn best_proto(ws_conns: &WsConns, directed: &str, node_id: &str) -> &'static str {
+    if ws_conns.lock().unwrap().contains_key(node_id) {
         "WS"
+    } else if directed.trim().eq_ignore_ascii_case("tcp") {
+        "TCP"
     } else {
         "UDP"
     }
 }
 
-/// Send an already-built control-message JSON to one peer over the best
-/// available transport (live WS, else UDP). Shared by every discrete feature.
+/// `best_proto` for a `NetCtx` (reads the engine's directed-transport setting).
+fn clip_proto<P: Platform>(ctx: &NetCtx<P>, node_id: &str) -> &'static str {
+    let directed = ctx.directed_transport.lock().unwrap().clone();
+    best_proto(&ctx.ws_conns, &directed, node_id)
+}
+
+/// Send an already-built control-message JSON to one peer over the active
+/// connection (live WS/punch/WebRTC), else the directed transport. Shared by
+/// every discrete feature.
 pub(crate) fn send_control_to<P: Platform>(ctx: &NetCtx<P>, node_id: &str, text: &str) {
     let from = ctx.identity.lock().unwrap().name.clone();
     let proto = clip_proto(ctx, node_id);

@@ -59,6 +59,9 @@ pub struct NetCtx<P: Platform> {
     pub installed_apps: Arc<Mutex<String>>,
     /// App-notification subscriptions (subscriber node_id -> packages).
     pub subs: Subs,
+    /// Directed transport for peers with no live persistent channel: "UDP"
+    /// (default) or "TCP". A live WS/punch/WebRTC link always wins over this.
+    pub directed_transport: Arc<Mutex<String>>,
 }
 
 impl<P: Platform> Clone for NetCtx<P> {
@@ -79,6 +82,7 @@ impl<P: Platform> Clone for NetCtx<P> {
             control: self.control.clone(),
             installed_apps: self.installed_apps.clone(),
             subs: self.subs.clone(),
+            directed_transport: self.directed_transport.clone(),
         }
     }
 }
@@ -116,6 +120,7 @@ pub struct Engine<P: Platform> {
     control: Arc<ControlRegistry<P>>,
     installed_apps: Arc<Mutex<String>>,
     subs: Subs,
+    directed_transport: Arc<Mutex<String>>,
 }
 
 impl<P: Platform> Engine<P> {
@@ -160,6 +165,7 @@ impl<P: Platform> Engine<P> {
         let control = Arc::new(ControlRegistry::with_defaults(platform.clipboard().is_some()));
         let installed_apps = Arc::new(Mutex::new(String::from("[]")));
         let subs: Subs = Arc::new(Mutex::new(HashMap::new()));
+        let directed_transport = Arc::new(Mutex::new(String::from("UDP")));
 
         // Discovery socket. If multicast bind fails (some networks/permissions),
         // fall back to a plain UDP socket for sending — messaging still works.
@@ -195,6 +201,7 @@ impl<P: Platform> Engine<P> {
             control: control.clone(),
             installed_apps: installed_apps.clone(),
             subs: subs.clone(),
+            directed_transport: directed_transport.clone(),
         };
 
         // Direct messaging receivers.
@@ -304,6 +311,7 @@ impl<P: Platform> Engine<P> {
             control,
             installed_apps,
             subs,
+            directed_transport,
         })
     }
 
@@ -324,14 +332,34 @@ impl<P: Platform> Engine<P> {
             control: self.control.clone(),
             installed_apps: self.installed_apps.clone(),
             subs: self.subs.clone(),
+            directed_transport: self.directed_transport.clone(),
         }
     }
 
-    /// Send an already-built control-message JSON to one peer (best transport).
+    /// The transport a message to `node_id` should use right now: the active
+    /// persistent link (WS/punch/WebRTC) if any, else the directed transport.
+    fn proto_for(&self, node_id: &str) -> &'static str {
+        let directed = self.directed_transport.lock().unwrap().clone();
+        transport::best_proto(&self.ws_conns, &directed, node_id)
+    }
+
+    /// Send an already-built control-message JSON to one peer (active connection).
     fn send_control(&self, node_id: &str, json: &str) -> Result<(), String> {
         let from = self.identity.lock().unwrap().name.clone();
-        let proto = if self.ws_conns.lock().unwrap().contains_key(node_id) { "WS" } else { "UDP" };
+        let proto = self.proto_for(node_id);
         transport::send_payload(&self.peers, &self.ws_conns, &self.key, &from, node_id, proto, json)
+    }
+
+    /// Directed transport setting ("UDP" | "TCP") for peers with no live link.
+    pub fn directed_transport(&self) -> String {
+        self.directed_transport.lock().unwrap().clone()
+    }
+
+    /// Set the directed transport ("UDP" default, or "TCP"); anything else maps
+    /// to UDP. Only affects peers without a live persistent connection.
+    pub fn set_directed_transport(&self, t: &str) {
+        let v = if t.trim().eq_ignore_ascii_case("tcp") { "TCP" } else { "UDP" };
+        *self.directed_transport.lock().unwrap() = v.to_string();
     }
 
     fn emit_peers(&self) {
@@ -558,14 +586,19 @@ impl<P: Platform> Engine<P> {
         ws::ws_connect(self.net_ctx(), &peer.ip, peer.ws_port)
     }
 
-    pub fn send(&self, node_id: &str, protocol: &str, text: &str) -> Result<(), String> {
+    /// Send a chat message, auto-selecting the transport: the active persistent
+    /// connection (WS/punch/WebRTC) if one is live, else the directed transport
+    /// (UDP/TCP). Returns the protocol used so the UI can report it.
+    pub fn send(&self, node_id: &str, text: &str) -> Result<String, String> {
         let from = self
             .username
             .lock()
             .unwrap()
             .clone()
             .unwrap_or_else(|| self.identity.lock().unwrap().name.clone());
-        transport::send_payload(&self.peers, &self.ws_conns, &self.key, &from, node_id, protocol, text)
+        let proto = self.proto_for(node_id);
+        transport::send_payload(&self.peers, &self.ws_conns, &self.key, &from, node_id, proto, text)?;
+        Ok(proto.to_string())
     }
 
     // --- clipboard ---
@@ -596,7 +629,7 @@ impl<P: Platform> Engine<P> {
         let me = self.identity.lock().unwrap().node_id.clone();
         let from = self.identity.lock().unwrap().name.clone();
         let req = serde_json::json!({ "type": "clipboard_request", "from": me }).to_string();
-        let proto = if self.ws_conns.lock().unwrap().contains_key(node_id) { "WS" } else { "UDP" };
+        let proto = self.proto_for(node_id);
 
         if let Err(e) = transport::send_payload(&self.peers, &self.ws_conns, &self.key, &from, node_id, proto, &req) {
             self.clip_pending.lock().unwrap().remove(node_id);
