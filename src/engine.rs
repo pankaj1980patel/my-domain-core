@@ -659,6 +659,19 @@ impl<P: Platform> Engine<P> {
         crate::registry::send_signal(&url, &token, &me, to, "signal", data)
     }
 
+    /// Round-trip FCM self-test: ask the server to push a `ping` to our own
+    /// device token. Returns the correlation id; the pong arrives via the
+    /// platform's FCM receiver (which the adapter surfaces to the UI). Verifies
+    /// the full push path end to end (server FCM send → device receive).
+    pub fn fcm_selftest(&self) -> Result<String, String> {
+        let url = self.server_url.lock().unwrap().clone().ok_or("not logged in")?;
+        let token = self.token.lock().unwrap().clone().ok_or("not logged in")?;
+        let node_id = self.identity.lock().unwrap().node_id.clone();
+        let sid = uuid::Uuid::new_v4().to_string();
+        crate::registry::send_selfping(&url, &token, &node_id, &sid)?;
+        Ok(sid)
+    }
+
     /// Handle an inbound signal (delivered by the platform's FCM receiver as the
     /// raw JSON `payload`). Drives the responder side of the connection ladder.
     pub fn on_signal(&self, from: &str, payload: &str) {

@@ -118,6 +118,18 @@ pub fn send_signal(
     Ok(())
 }
 
+/// Round-trip FCM self-test: ask the server to push a `ping` to our OWN device
+/// token. The pong is delivered back through the platform's FCM receiver. `sid`
+/// correlates the request with the received pong.
+pub fn send_selfping(url: &str, token: &str, node_id: &str, sid: &str) -> Result<(), String> {
+    ureq::post(&format!("{}/signal/selfping", base(url)))
+        .timeout(Duration::from_secs(10))
+        .set("Authorization", &format!("Bearer {token}"))
+        .send_json(serde_json::json!({ "node_id": node_id, "sid": sid }))
+        .map_err(http_err)?;
+    Ok(())
+}
+
 /// Partial live-state update (e.g. flip `ws_open`, record STUN mapping).
 pub fn update_device_state(
     url: &str,
